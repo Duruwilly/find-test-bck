@@ -1,7 +1,9 @@
 import hashlib
 import io
+import re
 import secrets
 import time
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -91,9 +93,48 @@ async def get_active_card(code: str, session: AsyncSession) -> Card:
     return card
 
 
-def valid_media_url(url: str | None) -> bool:
-    # Only accept media we served ourselves, never arbitrary external URLs.
-    return url is None or url.startswith(f"{settings.api_base_url}/media/")
+MEDIA_PATH_RE = re.compile(r"^/media/(photos|voice)/[A-Za-z0-9_-]+\.(webp|webm|ogg|opus|m4a|mp3)$")
+
+
+def base_url(request: Request) -> str:
+    """Public address of this API. Derived from the request unless API_BASE_URL is set,
+    so no per-environment URL config is needed behind Render/Fly/etc. proxies."""
+    if settings.api_base_url:
+        return settings.api_base_url.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc)
+    return f"{proto}://{host.split(',')[0].strip()}"
+
+
+def normalize_media(url: str | None) -> str | None:
+    """Accept only media we stored ourselves. Saves a host-independent path like
+    /media/photos/abc.webp so the database survives domain changes or a move to R2."""
+    if not url:
+        return None
+    path = urlparse(url).path
+    if not MEDIA_PATH_RE.match(path) or not (MEDIA_DIR / path[len("/media/"):]).is_file():
+        raise HTTPException(400, "Media must be uploaded through /api/media/upload")
+    return path
+
+
+def absolutize(value: str | None, request: Request) -> str | None:
+    if value and value.startswith("/"):
+        return f"{base_url(request)}{value}"
+    return value  # already absolute (older rows) or empty
+
+
+def card_out(card: Card, request: Request) -> CardOut:
+    return CardOut(
+        short_code=card.short_code,
+        title=card.title,
+        lat=card.lat,
+        lng=card.lng,
+        landmark_text=card.landmark_text,
+        gate_photo_url=absolutize(card.gate_photo_url, request),
+        voice_note_url=absolutize(card.voice_note_url, request),
+        is_public=card.is_public,
+        created_at=card.created_at,
+    )
 
 
 @app.get("/api/health")
@@ -105,15 +146,16 @@ async def health():
 @app.post("/api/cards", response_model=CardCreated, status_code=201)
 async def create_card(body: CardCreate, request: Request, session: AsyncSession = Depends(get_session)):
     rate_limit(f"create:{client_ip(request)}", limit=10, window=3600)
-    if not (valid_media_url(body.gate_photo_url) and valid_media_url(body.voice_note_url)):
-        raise HTTPException(400, "Media must be uploaded through /api/media/upload")
+    data = body.model_dump()
+    data["gate_photo_url"] = normalize_media(data["gate_photo_url"])
+    data["voice_note_url"] = normalize_media(data["voice_note_url"])
 
     token = secrets.token_urlsafe(24)
     for _ in range(5):
         card = Card(
             short_code=generate(ALPHABET, 7),
             edit_token_hash=hash_token(token),
-            **body.model_dump(),
+            **data,
         )
         session.add(card)
         try:
@@ -134,13 +176,14 @@ async def create_card(body: CardCreate, request: Request, session: AsyncSession 
 
 
 @app.get("/api/cards/{code}", response_model=CardOut)
-async def get_card(code: str, session: AsyncSession = Depends(get_session)):
-    return await get_active_card(code, session)
+async def get_card(code: str, request: Request, session: AsyncSession = Depends(get_session)):
+    return card_out(await get_active_card(code, session), request)
 
 
 @app.patch("/api/cards/{code}", response_model=CardOut)
 async def update_card(
     code: str,
+    request: Request,
     body: CardUpdate,
     x_edit_token: str = Header(...),
     session: AsyncSession = Depends(get_session),
@@ -149,12 +192,13 @@ async def update_card(
     if not card or not secrets.compare_digest(card.edit_token_hash, hash_token(x_edit_token)):
         raise HTTPException(403, "Invalid edit token")
     data = body.model_dump(exclude_unset=True)
-    if not (valid_media_url(data.get("gate_photo_url")) and valid_media_url(data.get("voice_note_url"))):
-        raise HTTPException(400, "Media must be uploaded through /api/media/upload")
+    for key in ("gate_photo_url", "voice_note_url"):
+        if key in data:
+            data[key] = normalize_media(data[key])
     for k, v in data.items():
         setattr(card, k, v)
     await session.commit()
-    return card
+    return card_out(card, request)
 
 
 @app.delete("/api/cards/{code}", status_code=204)
@@ -198,7 +242,7 @@ async def upload_media(request: Request, kind: str, file: UploadFile = File(...)
         path.write_bytes(raw)
         rel = f"voice/{path.name}"
 
-    return MediaOut(url=f"{settings.api_base_url}/media/{rel}", bytes=path.stat().st_size)
+    return MediaOut(url=f"{base_url(request)}/media/{rel}", bytes=path.stat().st_size)
 
 
 # ------------------------- corrections -------------------------

@@ -9,7 +9,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./findme.db"
     media_dir: str = "./media"
     public_base_url: str = "http://localhost:3001"
-    api_base_url: str = "http://localhost:8002"
+    # Leave empty to derive the API's public address from each request (recommended).
+    api_base_url: str = ""
     cors_origins: str = "http://localhost:3001"
     ip_hash_salt: str = "change-me"
 
